@@ -86,6 +86,21 @@ __host__ int host_full_reduce(int *A, int blocksize, int numElements) {
 	return A[0];
 }
 
+__global__ void
+segment_compass(){
+
+}
+
+__host__ void
+global_full_reduce(){
+
+}
+
+__host__ void
+shared_full_reduce(){
+
+}
+
 static void compare_results(const float *vector1, const float *vector2,
 		int numElements) {
 	for (int i = 0; i < numElements; ++i) {
