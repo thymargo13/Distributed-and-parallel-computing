@@ -33,8 +33,6 @@ __host__ void host_blk_reduce(int *A, int blocksize, int numElements) {
 				A[t] += A[t + i];
 			}
 		}
-//		printf("t:%d\n",t);
-//		printf("A[]:%d\n",A[t]);
 	}
 }
 
@@ -53,11 +51,6 @@ __global__ void single_thread_blk_reduce(int *A, int blocksize,
 			}
 		}
 	}
-	// add all first into A[0];
-//	for (int t = blocksize * 2; t < numElements; t <<= 1) {
-//		A[0] += A[t];
-//	}
-//	printf("in device ans:%d ", A[0]);
 }
 
 /**
