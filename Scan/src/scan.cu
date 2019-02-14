@@ -96,8 +96,8 @@ __global__ void blockScanBCAO(int *g_odata, int *g_idata, int n){
 	int ai = tid;
 	int bi = tid + (n/2);
 
-	int bankOffsetA = CONFLITCT_FREE_OFFSET(ai);
-	int bankOffsetB = CONFLITCT_FREE_OFFSET(bi);
+	int bankOffsetA = CONFLICT_FREE_OFFSET(ai);
+	int bankOffsetB = CONFLICT_FREE_OFFSET(bi);
 
 	temp[ai + bankOffsetA] = g_idata[ai];
 	temp[bi + bankOffsetB] = g_idata[bi];
