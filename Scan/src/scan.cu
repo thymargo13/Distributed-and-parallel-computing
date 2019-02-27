@@ -29,7 +29,7 @@ if (err != cudaSuccess) {\
     exit( EXIT_FAILURE );\
 }\
 }
-#define BLOCK_SIZE 64
+#define BLOCK_SIZE 128
 #define numElements 10000000
 #define NUM_BANKS 32
 #define LOG_NUM_BANKS 5
@@ -127,21 +127,22 @@ __global__ void d_blockScan(int *g_odata, int *g_idata, int n) {
 __global__ void d_blockScanBCAO(int *g_odata, int *g_idata, int n) {
 	// copy to shared memory
 	__shared__ int temp[BLOCK_SIZE * 2 + CONFLICT_FREE_OFFSET(BLOCK_SIZE * 2)];
-	const int locallen = BLOCK_SIZE * 2;
+	const int len = BLOCK_SIZE * 2;
 	int i = blockIdx.x * 2 * blockDim.x + threadIdx.x;
 	if (i < n)
 		temp[threadIdx.x + CONFLICT_FREE_OFFSET(threadIdx.x)] = g_idata[i];
 	i += BLOCK_SIZE;
 	if (i < n)
 		temp[(threadIdx.x + BLOCK_SIZE)
-				+ CONFLICT_FREE_OFFSET((threadIdx.x + BLOCK_SIZE))] = g_idata[i];
+				+ CONFLICT_FREE_OFFSET((threadIdx.x + BLOCK_SIZE))] =
+				g_idata[i];
 
 	// thread id and offset
 	const int thid = threadIdx.x;
 	int offset = 1;
 
 	// build sum in place up the tree
-	for (int d = locallen >> 1; d > 0; d >>= 1) {
+	for (int d = len >> 1; d > 0; d >>= 1) {
 		__syncthreads();
 		if (thid < d) {
 			int ai = offset * (2 * thid + 1) - 1;
@@ -155,11 +156,11 @@ __global__ void d_blockScanBCAO(int *g_odata, int *g_idata, int n) {
 
 	// Clear the last element
 	if (thid == 0) {
-		temp[locallen - 1 + CONFLICT_FREE_OFFSET(locallen - 1)] = 0;
+		temp[len - 1 + CONFLICT_FREE_OFFSET(len - 1)] = 0;
 	}
 
 	// traverse down tree and build scan
-	for (int d = 1; d < locallen; d *= 2) {
+	for (int d = 1; d < len; d *= 2) {
 		offset >>= 1;
 		__syncthreads();
 		if (thid < d) {
@@ -183,14 +184,214 @@ __global__ void d_blockScanBCAO(int *g_odata, int *g_idata, int n) {
 	if (i < n)
 		g_odata[i] = temp[threadIdx.x + CONFLICT_FREE_OFFSET(threadIdx.x)];
 }
+
 // Device Full Scan without BCAO
-__global__ void fullScan() {
-
+__global__ void d_fullScanSum(int* g_odata, int* sums, int n) {
+	int i = blockIdx.x * 2 * blockDim.x + threadIdx.x;
+	if (blockIdx.x > 0) {
+		if (i < n) {
+			g_odata[i] += sums[blockIdx.x];
+		}
+		i += blockDim.x;
+		if (i < n) {
+			g_odata[i] += sums[blockIdx.x];
+		}
+	}
 }
+__global__ void d_fullScanHelp(int* g_odata, int* g_idata, int* sums, int n) {
+	// copy to shared memory
+	__shared__ int temp[BLOCK_SIZE * 2];
+	int len = BLOCK_SIZE * 2;
+	int i = blockIdx.x * 2 * blockDim.x + threadIdx.x;
+	if (i < n)
+		temp[threadIdx.x] = g_idata[i];
+	i += BLOCK_SIZE;
+	if (i < n)
+		temp[threadIdx.x + BLOCK_SIZE] = g_idata[i];
+
+	// thread id and offset
+	int tid = threadIdx.x;
+	int offset = 1;
+	// build sum in place up the tree
+	for (int d = len >> 1; d > 0; d >>= 1) {
+		__syncthreads();
+		if (tid < d) {
+			int ai = offset * (2 * tid + 1) - 1;
+			int bi = offset * (2 * tid + 2) - 1;
+			temp[bi] += temp[ai];
+		}
+		offset *= 2;
+	}
+
+	// Clear the last element
+	if (tid == 0) {
+		sums[blockIdx.x] = temp[len - 1];
+		temp[len - 1] = 0;
+	}
+
+	// traverse down tree and build scan
+	for (int d = 1; d < len; d *= 2) {
+		offset >>= 1;
+		__syncthreads();
+		if (tid < d) {
+			int ai = offset * (2 * tid + 1) - 1;
+			int bi = offset * (2 * tid + 2) - 1;
+			int t = temp[ai];
+			temp[ai] = temp[bi];
+			temp[bi] += t;
+		}
+	}
+
+	__syncthreads();
+
+	// copy to output
+	if (i < n)
+		g_odata[i] = temp[threadIdx.x + BLOCK_SIZE];
+	i -= BLOCK_SIZE;
+	if (i < n)
+		g_odata[i] = temp[threadIdx.x];
+}
+int d_fullScan(int* g_odata, int* g_idata, int n) {
+	// Error code to check return values for CUDA calls
+	cudaError_t err = cudaSuccess;
+	int blockspergrid;
+	int level;
+	int * sums = NULL;
+
+	if (n <= 2 * BLOCK_SIZE) {
+		d_blockScan<<<1, BLOCK_SIZE>>>(g_odata, g_idata, n);
+		return 1;  // 1 level
+	} else if (n <= 2 * 2 * BLOCK_SIZE * BLOCK_SIZE) {
+		blockspergrid = 1 + (n - 1) / BLOCK_SIZE;
+		err = cudaMalloc((void**) &sums, blockspergrid * sizeof(int));
+		CUDA_ERROR(err, "Failed to allocate SUMS buffer");
+		// block scan elements
+		d_fullScanHelp<<<blockspergrid, BLOCK_SIZE>>>(g_odata, g_idata, sums,
+				n);
+		// block scan sum
+		d_blockScan<<<1, BLOCK_SIZE>>>(sums, sums, blockspergrid);
+		// add sums to elements
+		d_fullScanSum<<<blockspergrid, BLOCK_SIZE>>>(g_odata, sums, n);
+		//free sums
+		err = cudaFree(sums);
+		CUDA_ERROR(err, "Fail to free sums");
+		return 2; // 2 level
+	}
+	// more level scan
+	blockspergrid = 1 + (n - 1) / BLOCK_SIZE;
+	err = cudaMalloc((void**) &sums, blockspergrid * sizeof(int));
+	CUDA_ERROR(err, "Failed to allocate SUMS buffer");
+	// scan elements
+	d_fullScanHelp<<<blockspergrid, BLOCK_SIZE>>>(g_odata, g_idata, sums, n);
+	level = 1 + d_fullScan(sums, sums, blockspergrid);
+	d_fullScanSum<<<blockspergrid, BLOCK_SIZE>>>(g_odata, sums, n);
+	err = cudaFree(sums);
+	CUDA_ERROR(err, "Failed to free sums");
+	return level;
+}
+
 // Device Full Scan with BCAO
-__global__ void fullScanBCAO() {
+__global__ void d_fullScanBCAO_h(int * g_odata, int * g_idata, int *SUMS,
+		int len) {
+	// copy to shared memory
+	__shared__ int temp[BLOCK_SIZE * 2 + CONFLICT_FREE_OFFSET(BLOCK_SIZE * 2)];
+	const int locallen = BLOCK_SIZE * 2;
+	int i = blockIdx.x * 2 * blockDim.x + threadIdx.x;
+	if (i < len)
+		temp[threadIdx.x + CONFLICT_FREE_OFFSET(threadIdx.x)] = g_idata[i];
+	i += BLOCK_SIZE;
+	if (i < len)
+		temp[(threadIdx.x + BLOCK_SIZE)
+				+ CONFLICT_FREE_OFFSET((threadIdx.x + BLOCK_SIZE))] = g_idata[i];
 
+	// thread id and offset
+	const int thid = threadIdx.x;
+	int offset = 1;
+
+	// build sum in place up the tree
+	for (int d = locallen >> 1; d > 0; d >>= 1) {
+		__syncthreads();
+		if (thid < d) {
+			int ai = offset * (2 * thid + 1) - 1;
+			int bi = offset * (2 * thid + 2) - 1;
+			ai += CONFLICT_FREE_OFFSET(ai);
+			bi += CONFLICT_FREE_OFFSET(bi);
+			temp[bi] += temp[ai];
+		}
+		offset *= 2;
+	}
+
+	// Clear the last element
+	if (thid == 0) {
+		SUMS[blockIdx.x] =
+				temp[locallen - 1 + CONFLICT_FREE_OFFSET(locallen - 1)];
+		temp[locallen - 1 + CONFLICT_FREE_OFFSET(locallen - 1)] = 0;
+	}
+
+	// traverse down tree and build scan
+	for (int d = 1; d < locallen; d *= 2) {
+		offset >>= 1;
+		__syncthreads();
+		if (thid < d) {
+			int ai = offset * (2 * thid + 1) - 1;
+			int bi = offset * (2 * thid + 2) - 1;
+			ai += CONFLICT_FREE_OFFSET(ai);
+			bi += CONFLICT_FREE_OFFSET(bi);
+			int t = temp[ai];
+			temp[ai] = temp[bi];
+			temp[bi] += t;
+		}
+	}
+
+	__syncthreads();
+
+	// copy to output
+	if (i < len)
+		g_odata[i] = temp[(threadIdx.x + BLOCK_SIZE)
+				+ CONFLICT_FREE_OFFSET((threadIdx.x + BLOCK_SIZE))];
+	i -= BLOCK_SIZE;
+	if (i < len)
+		g_odata[i] = temp[threadIdx.x + CONFLICT_FREE_OFFSET(threadIdx.x)];
 }
+
+
+int d_fullScanBCAO(int* g_odata, int* g_idata, int n) {
+	// Error code to check return values for CUDA calls
+	cudaError_t err = cudaSuccess;
+	int blockspergrid = 1 + (n - 1) / BLOCK_SIZE;
+	int level;
+	int * sums = NULL;
+
+	if (n <= 2 * BLOCK_SIZE) {
+		d_blockScanBCAO<<<1, BLOCK_SIZE>>>(g_odata, g_idata, n);
+		return 1;  // 1 level
+	} else if (n <= 2 * 2 * BLOCK_SIZE * BLOCK_SIZE) {
+		err = cudaMalloc((void**) &sums, blockspergrid * sizeof(int));
+		CUDA_ERROR(err, "Failed to allocate SUMS buffer");
+		// block scan elements
+		d_fullScanBCAO_h<<<blockspergrid, BLOCK_SIZE>>>(g_odata, g_idata, sums,
+				n);
+		// block scan sum
+		d_blockScanBCAO<<<1, BLOCK_SIZE>>>(sums, sums, blockspergrid);
+		// add sums to elements
+		d_fullScanSum<<<blockspergrid, BLOCK_SIZE>>>(g_odata, sums, n);
+		//free sums
+		err = cudaFree(sums);
+		CUDA_ERROR(err, "Fail to free sums");
+		return 2; // 2 level
+	}
+	// more level scan
+	err = cudaMalloc((void**) &sums, blockspergrid * sizeof(int));
+	CUDA_ERROR(err, "Failed to allocate SUMS buffer");
+	// scan elements
+	d_fullScanBCAO_h<<<blockspergrid, BLOCK_SIZE>>>(g_odata, g_idata, sums, n);
+	level = 1 + d_fullScan(sums, sums, blockspergrid);
+	d_fullScanSum<<<blockspergrid, BLOCK_SIZE>>>(g_odata, sums, n);
+	err = cudaFree(sums);
+	CUDA_ERROR(err, "Failed to free sums");
+	return level;
+}
+
 int main(void) {
 
 	// Error code to check return values for CUDA calls
@@ -289,7 +490,6 @@ int main(void) {
 	compare_results(h_bO, h_C, numElements);
 	printf("Test PASSED\n");
 
-
 	/*----- Execute the Block Scan with BCAO on the Device and time it: ----*/
 	cudaEventRecord(start, 0);
 	//<< blocks per grid, threads per block, size of share memory>>
@@ -306,15 +506,59 @@ int main(void) {
 	printf("Copy output data from the CUDA device to the host memory\n");
 	err = cudaMemcpy(h_C, d_O, size, cudaMemcpyDeviceToHost);
 	CUDA_ERROR(err, "Failed to copy vector d_O from device to host");
-	printf("Executed Block Scan with BCAO of %d elements on the Device in = %.5fmSecs\n",
-	numElements, d_msecs);
+	printf(
+			"Executed Block Scan with BCAO of %d elements on the Device in = %.5fmSecs\n",
+			numElements, d_msecs);
 	// Verify that the result vector is correct
 	compare_results(h_bO, h_C, numElements);
 	printf("Test PASSED\n");
 
+	int levels;
 	/*----- Execute the Full Scan on the Device and time it: ----*/
+	cudaEventRecord(start, 0);
+	//<< blocks per grid, threads per block, size of share memory>>
+	levels = d_fullScan(d_O, d_A, numElements);
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+	// wait for device to finish
+	cudaDeviceSynchronize();
+	err = cudaGetLastError();
+	CUDA_ERROR(err, "Failed to launch Full scan kernel");
+	err = cudaEventElapsedTime(&d_msecs, start, stop);
+	CUDA_ERROR(err, "Failed to get elapsed time");
+	// Copy the device result vector d_O in device memory to the host result vector in host memory.
+	printf("Copy output data from the CUDA device to the host memory\n");
+	err = cudaMemcpy(h_C, d_O, size, cudaMemcpyDeviceToHost);
+	CUDA_ERROR(err, "Failed to copy vector d_O from device to host");
+	printf(
+			"Executed Full Scan without BCAO of %d elements with %d levels on the Device in = %.5fmSecs\n",
+			numElements, levels, d_msecs);
+	// Verify that the result vector is correct
+	compare_results(h_fO, h_C, numElements);
+	printf("Test PASSED\n");
 
 	/*----- Execute the Full Scan with BCAO on the Device and time it: ----*/
+	cudaEventRecord(start, 0);
+	//<< blocks per grid, threads per block, size of share memory>>
+	levels = d_fullScanBCAO(d_O, d_A, numElements);
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+	// wait for device to finish
+	cudaDeviceSynchronize();
+	err = cudaGetLastError();
+	CUDA_ERROR(err, "Failed to launch Full scan with BCAO kernel");
+	err = cudaEventElapsedTime(&d_msecs, start, stop);
+	CUDA_ERROR(err, "Failed to get elapsed time");
+	// Copy the device result vector d_O in device memory to the host result vector in host memory.
+	printf("Copy output data from the CUDA device to the host memory\n");
+	err = cudaMemcpy(h_C, d_O, size, cudaMemcpyDeviceToHost);
+	CUDA_ERROR(err, "Failed to copy vector d_O from device to host");
+	printf(
+			"Executed Full Scan with BCAO of %d elements with %d levels on the Device in = %.5fmSecs\n",
+			numElements, levels, d_msecs);
+	// Verify that the result vector is correct
+	compare_results(h_fO, h_C, numElements);
+	printf("Test PASSED\n");
 
 	/*------------ FREE -----------*/
 	//Free device global memory
